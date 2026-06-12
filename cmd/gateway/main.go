@@ -55,7 +55,43 @@ func main() {
 		dropPolicy,
 	)
 
+	var sortingWindow *buffer.SortingWindow
+	var stopCh chan struct{}
+
+	if cfg.SortingWindow.Enabled {
+		stopCh = make(chan struct{})
+
+		frameInterval := time.Second / time.Duration(cfg.PMU.ExpectedFrameRate)
+		validator := buffer.NewTimestampValidator(
+			cfg.SortingWindow.MaxForwardDrift,
+			cfg.SortingWindow.MaxBackwardStep,
+			frameInterval,
+		)
+
+		onEvict := func(d *c37118.PMUData) {
+			sb.Push(d)
+		}
+
+		sortingWindow = buffer.NewSortingWindow(
+			cfg.SortingWindow.MaxSlots,
+			cfg.SortingWindow.TTL,
+			cfg.SortingWindow.WindowWidth,
+			validator,
+			onEvict,
+		)
+
+		go sortingWindow.RunTTLScanner(cfg.SortingWindow.ScannerInterval, stopCh)
+
+		log.Printf("SortingWindow enabled: ttl=%v width=%v max_slots=%d scanner=%v",
+			cfg.SortingWindow.TTL, cfg.SortingWindow.WindowWidth,
+			cfg.SortingWindow.MaxSlots, cfg.SortingWindow.ScannerInterval)
+	}
+
 	handler := func(d *c37118.PMUData) {
+		if sortingWindow != nil {
+			sortingWindow.Insert(d)
+			return
+		}
 		sb.Push(d)
 	}
 
@@ -103,7 +139,7 @@ func main() {
 		log.Printf("Metrics server listening on %s", cfg.Metrics.ListenAddr)
 	}
 
-	go statsReporter(tcpServer, udpServer, sb, writer, batcher, registry)
+	go statsReporter(tcpServer, udpServer, sb, writer, batcher, sortingWindow, registry)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -112,11 +148,17 @@ func main() {
 	<-sigCh
 	log.Println("Shutting down...")
 
+	if stopCh != nil {
+		close(stopCh)
+	}
 	if tcpServer != nil {
 		tcpServer.Stop()
 	}
 	if udpServer != nil {
 		udpServer.Stop()
+	}
+	if sortingWindow != nil {
+		sortingWindow.ForceExpireAll()
 	}
 	batcher.Stop()
 	writer.Stop()
@@ -127,14 +169,16 @@ func main() {
 
 func statsReporter(tcpSrv *transport.TCPServer, udpSrv *transport.UDPServer,
 	sb *buffer.ShardedBuffer, writer *timescaledb.Writer,
-	batcher *timescaledb.Batcher, reg *metrics.Registry) {
+	batcher *timescaledb.Batcher,
+	sw *buffer.SortingWindow,
+	reg *metrics.Registry) {
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	var (
-		prevFrames    uint64
-		prevWritten   uint64
+		prevFrames  uint64
+		prevWritten uint64
 	)
 
 	bufFrames := reg.Counter("pmu_frames_parsed_total")
@@ -145,6 +189,10 @@ func statsReporter(tcpSrv *transport.TCPServer, udpSrv *transport.UDPServer,
 	bufLen := reg.Gauge("pmu_buffer_length")
 	ppsGauge := reg.Gauge("pmu_pps")
 	wpsGauge := reg.Gauge("pmu_writes_per_sec")
+	swLen := reg.Gauge("pmu_sorting_window_slots")
+	swExpired := reg.Counter("pmu_sorting_window_expired_total")
+	swTTLBreach := reg.Counter("pmu_sorting_window_ttl_breaches_total")
+	swBackwardDrops := reg.Counter("pmu_timestamp_backward_drops_total")
 
 	for range ticker.C {
 		var framesParsed, parseErrs uint64
@@ -180,8 +228,18 @@ func statsReporter(tcpSrv *transport.TCPServer, udpSrv *transport.UDPServer,
 		ppsGauge.SetInt(int64(pps / 5))
 		wpsGauge.SetInt(int64(wps / 5))
 
-		log.Printf("stats: conns=%d buf=%d pps=%d wps=%d dropped=%d parse_err=%d db_err=%d batches=%d",
+		var swStats buffer.WindowStats
+		if sw != nil {
+			swStats = sw.Stats()
+			swLen.SetInt(swStats.CurrentSlots)
+			swExpired.Add(swStats.Expired)
+			swTTLBreach.Add(swStats.TTLBreaches)
+			swBackwardDrops.Add(swStats.BackwardDrops)
+		}
+
+		log.Printf("stats: conns=%d buf=%d pps=%d wps=%d dropped=%d parse_err=%d db_err=%d batches=%d sw_slots=%d sw_expired=%d sw_ttl_breach=%d sw_backward=%d",
 			activeConn, sb.TotalLen(), pps/5, wps/5,
-			bufStats.Dropped, parseErrs, dbStats.WriteErrors, batchStats.BatchesCreated)
+			bufStats.Dropped, parseErrs, dbStats.WriteErrors, batchStats.BatchesCreated,
+			swStats.CurrentSlots, swStats.Expired, swStats.TTLBreaches, swStats.BackwardDrops)
 	}
 }

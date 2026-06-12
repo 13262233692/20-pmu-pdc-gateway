@@ -8,12 +8,13 @@ import (
 )
 
 type Config struct {
-	TCP          TCPConfig
-	UDP          UDPConfig
-	Database     DatabaseConfig
-	Buffer       BufferConfig
-	Metrics      MetricsConfig
-	PMU          PMUConfig
+	TCP           TCPConfig
+	UDP           UDPConfig
+	Database      DatabaseConfig
+	Buffer        BufferConfig
+	Metrics       MetricsConfig
+	PMU           PMUConfig
+	SortingWindow SortingWindowConfig
 }
 
 type TCPConfig struct {
@@ -61,6 +62,16 @@ type PMUConfig struct {
 	MaxPhasors        int
 }
 
+type SortingWindowConfig struct {
+	Enabled           bool
+	MaxSlots          int
+	TTL               time.Duration
+	WindowWidth       time.Duration
+	ScannerInterval   time.Duration
+	MaxForwardDrift   time.Duration
+	MaxBackwardStep   time.Duration
+}
+
 func Load() *Config {
 	cfg := &Config{}
 
@@ -96,6 +107,14 @@ func Load() *Config {
 
 	flag.IntVar(&cfg.PMU.ExpectedFrameRate, "pmu-frame-rate", envInt("PMU_FRAME_RATE", 100), "Expected PMU frame rate (Hz)")
 	flag.IntVar(&cfg.PMU.MaxPhasors, "pmu-max-phasors", envInt("PMU_MAX_PHASORS", 32), "Max phasors per PMU")
+
+	flag.BoolVar(&cfg.SortingWindow.Enabled, "sw-enabled", envBool("SW_ENABLED", true), "Enable sorting window with TTL eviction")
+	flag.IntVar(&cfg.SortingWindow.MaxSlots, "sw-max-slots", envInt("SW_MAX_SLOTS", 1048576), "Sorting window max slots")
+	flag.DurationVar(&cfg.SortingWindow.TTL, "sw-ttl", envDuration("SW_TTL", 500*time.Millisecond), "Sorting window TTL for forced eviction")
+	flag.DurationVar(&cfg.SortingWindow.WindowWidth, "sw-window-width", envDuration("SW_WINDOW_WIDTH", 200*time.Millisecond), "Sorting window sliding width")
+	flag.DurationVar(&cfg.SortingWindow.ScannerInterval, "sw-scanner-interval", envDuration("SW_SCANNER_INTERVAL", 50*time.Millisecond), "Sorting window TTL scanner interval")
+	flag.DurationVar(&cfg.SortingWindow.MaxForwardDrift, "sw-max-forward-drift", envDuration("SW_MAX_FORWARD_DRIFT", 2*time.Second), "Max allowed forward timestamp drift")
+	flag.DurationVar(&cfg.SortingWindow.MaxBackwardStep, "sw-max-backward-step", envDuration("SW_MAX_BACKWARD_STEP", 10*time.Millisecond), "Max allowed backward timestamp step")
 
 	flag.Parse()
 	return cfg
