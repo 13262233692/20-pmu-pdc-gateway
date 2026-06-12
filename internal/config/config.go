@@ -15,6 +15,7 @@ type Config struct {
 	Metrics       MetricsConfig
 	PMU           PMUConfig
 	SortingWindow SortingWindowConfig
+	Analytics     AnalyticsConfig
 }
 
 type TCPConfig struct {
@@ -72,6 +73,18 @@ type SortingWindowConfig struct {
 	MaxBackwardStep   time.Duration
 }
 
+type AnalyticsConfig struct {
+	Enabled          bool
+	WindowSeconds    float64
+	AnalysisInterval time.Duration
+	LowDampingThresh float64
+	WarningDuration  time.Duration
+	MinFrequency     float64
+	MaxFrequency     float64
+	WorkerCount      int
+	MinAmplitude     float64
+}
+
 func Load() *Config {
 	cfg := &Config{}
 
@@ -116,6 +129,16 @@ func Load() *Config {
 	flag.DurationVar(&cfg.SortingWindow.MaxForwardDrift, "sw-max-forward-drift", envDuration("SW_MAX_FORWARD_DRIFT", 2*time.Second), "Max allowed forward timestamp drift")
 	flag.DurationVar(&cfg.SortingWindow.MaxBackwardStep, "sw-max-backward-step", envDuration("SW_MAX_BACKWARD_STEP", 10*time.Millisecond), "Max allowed backward timestamp step")
 
+	flag.BoolVar(&cfg.Analytics.Enabled, "ana-enabled", envBool("ANA_ENABLED", true), "Enable low-frequency oscillation analytics")
+	flag.Float64Var(&cfg.Analytics.WindowSeconds, "ana-window-seconds", envFloat("ANA_WINDOW_SECONDS", 5.0), "Analysis window size in seconds")
+	flag.DurationVar(&cfg.Analytics.AnalysisInterval, "ana-interval", envDuration("ANA_INTERVAL", 200*time.Millisecond), "Analysis interval")
+	flag.Float64Var(&cfg.Analytics.LowDampingThresh, "ana-damping-thresh", envFloat("ANA_DAMPING_THRESH", 0.05), "Low damping threshold (5%)")
+	flag.DurationVar(&cfg.Analytics.WarningDuration, "ana-warning-dur", envDuration("ANA_WARNING_DUR", 3*time.Second), "Consecutive low damping duration for warning")
+	flag.Float64Var(&cfg.Analytics.MinFrequency, "ana-min-freq", envFloat("ANA_MIN_FREQ", 0.1), "Minimum oscillation frequency (Hz)")
+	flag.Float64Var(&cfg.Analytics.MaxFrequency, "ana-max-freq", envFloat("ANA_MAX_FREQ", 2.5), "Maximum oscillation frequency (Hz)")
+	flag.IntVar(&cfg.Analytics.WorkerCount, "ana-workers", envInt("ANA_WORKERS", 4), "Analysis worker count")
+	flag.Float64Var(&cfg.Analytics.MinAmplitude, "ana-min-amp", envFloat("ANA_MIN_AMP", 0.001), "Minimum oscillation amplitude")
+
 	flag.Parse()
 	return cfg
 }
@@ -153,3 +176,13 @@ func envDuration(key string, def time.Duration) time.Duration {
 	}
 	return def
 }
+
+func envFloat(key string, def float64) float64 {
+	if v, ok := os.LookupEnv(key); ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+

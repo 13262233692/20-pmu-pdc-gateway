@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wams/pmu-pdc-gateway/internal/analytics"
 	"github.com/wams/pmu-pdc-gateway/internal/buffer"
 	"github.com/wams/pmu-pdc-gateway/internal/config"
 	"github.com/wams/pmu-pdc-gateway/internal/metrics"
@@ -87,7 +88,58 @@ func main() {
 			cfg.SortingWindow.MaxSlots, cfg.SortingWindow.ScannerInterval)
 	}
 
+	var detector *analytics.LowFreqOscillationDetector
+	var freqWindowMgr *analytics.FreqWindowManager
+
+	if cfg.Analytics.Enabled {
+		windowSize := int(cfg.Analytics.WindowSeconds * float64(cfg.PMU.ExpectedFrameRate))
+		freqWindowMgr = analytics.NewFreqWindowManager(
+			windowSize,
+			cfg.PMU.ExpectedFrameRate,
+			time.Duration(cfg.Analytics.WindowSeconds)*time.Second,
+		)
+
+		alertCb := func(alert analytics.OscillationAlert) {
+			sevStr := ""
+			switch alert.Severity {
+			case analytics.SeverityEmergency:
+				sevStr = "EMERGENCY"
+			case analytics.SeverityCritical:
+				sevStr = "CRITICAL"
+			case analytics.SeverityWarning:
+				sevStr = "WARNING"
+			default:
+				sevStr = "INFO"
+			}
+			log.Printf("[ALERT %s] PMU=%d freq=%.3fHz damping=%.4f%% amp=%.4f - %s | Action: %s",
+				sevStr, alert.PMUID, alert.Frequency,
+				alert.DampingRatio*100, alert.Amplitude,
+				alert.Description, alert.Action)
+		}
+
+		detCfg := analytics.DefaultDetectorConfig()
+		detCfg.WindowSeconds = cfg.Analytics.WindowSeconds
+		detCfg.SampleRate = float64(cfg.PMU.ExpectedFrameRate)
+		detCfg.AnalysisInterval = cfg.Analytics.AnalysisInterval
+		detCfg.LowDampingThresh = cfg.Analytics.LowDampingThresh
+		detCfg.WarningDuration = cfg.Analytics.WarningDuration
+		detCfg.MinFrequency = cfg.Analytics.MinFrequency
+		detCfg.MaxFrequency = cfg.Analytics.MaxFrequency
+		detCfg.WorkerCount = cfg.Analytics.WorkerCount
+		detCfg.MinAmplitude = cfg.Analytics.MinAmplitude
+
+		detector = analytics.NewLowFreqOscillationDetector(detCfg, freqWindowMgr, alertCb)
+		detector.Start()
+
+		log.Printf("Analytics enabled: window=%.1fs interval=%v workers=%d freq=[%.1f, %.1f]Hz",
+			cfg.Analytics.WindowSeconds, cfg.Analytics.AnalysisInterval,
+			cfg.Analytics.WorkerCount, cfg.Analytics.MinFrequency, cfg.Analytics.MaxFrequency)
+	}
+
 	handler := func(d *c37118.PMUData) {
+		if freqWindowMgr != nil {
+			freqWindowMgr.HandlePMUData(d)
+		}
 		if sortingWindow != nil {
 			sortingWindow.Insert(d)
 			return
@@ -139,7 +191,7 @@ func main() {
 		log.Printf("Metrics server listening on %s", cfg.Metrics.ListenAddr)
 	}
 
-	go statsReporter(tcpServer, udpServer, sb, writer, batcher, sortingWindow, registry)
+	go statsReporter(tcpServer, udpServer, sb, writer, batcher, sortingWindow, detector, freqWindowMgr, registry)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -160,6 +212,9 @@ func main() {
 	if sortingWindow != nil {
 		sortingWindow.ForceExpireAll()
 	}
+	if detector != nil {
+		detector.Stop()
+	}
 	batcher.Stop()
 	writer.Stop()
 	metricServer.Stop()
@@ -171,6 +226,8 @@ func statsReporter(tcpSrv *transport.TCPServer, udpSrv *transport.UDPServer,
 	sb *buffer.ShardedBuffer, writer *timescaledb.Writer,
 	batcher *timescaledb.Batcher,
 	sw *buffer.SortingWindow,
+	det *analytics.LowFreqOscillationDetector,
+	fwm *analytics.FreqWindowManager,
 	reg *metrics.Registry) {
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -193,6 +250,11 @@ func statsReporter(tcpSrv *transport.TCPServer, udpSrv *transport.UDPServer,
 	swExpired := reg.Counter("pmu_sorting_window_expired_total")
 	swTTLBreach := reg.Counter("pmu_sorting_window_ttl_breaches_total")
 	swBackwardDrops := reg.Counter("pmu_timestamp_backward_drops_total")
+	pmuCount := reg.Gauge("pmu_tracked_count")
+	anaAnalyses := reg.Counter("pmu_ana_analyses_total")
+	anaAlerts := reg.Counter("pmu_ana_alerts_total")
+	anaModes := reg.Gauge("pmu_ana_modes_detected")
+	anaActiveAlerts := reg.Gauge("pmu_ana_active_alerts")
 
 	for range ticker.C {
 		var framesParsed, parseErrs uint64
@@ -237,9 +299,46 @@ func statsReporter(tcpSrv *transport.TCPServer, udpSrv *transport.UDPServer,
 			swBackwardDrops.Add(swStats.BackwardDrops)
 		}
 
-		log.Printf("stats: conns=%d buf=%d pps=%d wps=%d dropped=%d parse_err=%d db_err=%d batches=%d sw_slots=%d sw_expired=%d sw_ttl_breach=%d sw_backward=%d",
+		if fwm != nil {
+			pmuCount.SetInt(int64(fwm.PMUCount()))
+		}
+
+		if det != nil {
+			detStats := det.Stats()
+			anaAnalyses.Add(detStats.Analyses)
+			anaAlerts.Add(detStats.AlertsIssued)
+			anaModes.SetInt(int64(detStats.ModesDetected))
+			anaActiveAlerts.SetInt(detStats.ActiveAlerts)
+		}
+
+		log.Printf("stats: conns=%d buf=%d pps=%d wps=%d dropped=%d parse_err=%d db_err=%d batches=%d sw_slots=%d sw_expired=%d sw_ttl_breach=%d pmus=%d ana=%d alerts=%d active_alerts=%d",
 			activeConn, sb.TotalLen(), pps/5, wps/5,
 			bufStats.Dropped, parseErrs, dbStats.WriteErrors, batchStats.BatchesCreated,
-			swStats.CurrentSlots, swStats.Expired, swStats.TTLBreaches, swStats.BackwardDrops)
+			swStats.CurrentSlots, swStats.Expired, swStats.TTLBreaches,
+			pmuCountGaugeValue(pmuCount), detStatsValue(det, "analyses"),
+			detStatsValue(det, "alerts"), detStatsValue(det, "active"))
+	}
+}
+
+func pmuCountGaugeValue(g *metrics.Gauge) int64 {
+	return int64(g.ValueInt())
+}
+
+func detStatsValue(det *analytics.LowFreqOscillationDetector, key string) int64 {
+	if det == nil {
+		return 0
+	}
+	st := det.Stats()
+	switch key {
+	case "analyses":
+		return int64(st.Analyses)
+	case "alerts":
+		return int64(st.AlertsIssued)
+	case "modes":
+		return int64(st.ModesDetected)
+	case "active":
+		return st.ActiveAlerts
+	default:
+		return 0
 	}
 }
